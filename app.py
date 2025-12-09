@@ -1,22 +1,16 @@
-"""
-TRIFUSION Forecasting Application with DOSM Data
-Enhanced with improved error handling, data validation, and PyTorch device compatibility
-"""
-
 import logging
 import sys
 import traceback
 from typing import Optional, Tuple, Union
 import warnings
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-import streamlit as st
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
 
 # Configure logging
 logging.basicConfig(
@@ -31,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
-
 
 class DeviceManager:
     """Manages PyTorch device compatibility (CPU/GPU)"""
@@ -56,7 +49,6 @@ class DeviceManager:
         except Exception as e:
             logger.warning(f"Error checking GPU availability: {e}. Falling back to CPU")
             return torch.device('cpu')
-
 
 class DataValidator:
     """Validates input data for model processing"""
@@ -139,11 +131,10 @@ class DataValidator:
         
         return True, "Sequence length validation passed"
 
-
 class LSTMModel(nn.Module):
     """Enhanced LSTM model with device compatibility"""
     
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_size: int, 
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_size: int,
                  dropout: float = 0.2, device: Optional[torch.device] = None):
         """
         Initialize LSTM model
@@ -200,7 +191,6 @@ class LSTMModel(nn.Module):
         except Exception as e:
             logger.error(f"Error in forward pass: {e}")
             raise
-
 
 class DataPreprocessor:
     """Handles data preprocessing with validation"""
@@ -310,11 +300,10 @@ class DataPreprocessor:
             logger.error(f"Error in inverse transform: {e}")
             raise
 
-
 class ModelTrainer:
     """Handles model training with error handling"""
     
-    def __init__(self, model: LSTMModel, device: Optional[torch.device] = None, 
+    def __init__(self, model: LSTMModel, device: Optional[torch.device] = None,
                  learning_rate: float = 0.001):
         """
         Initialize trainer
@@ -417,172 +406,166 @@ class ModelTrainer:
             logger.error(f"Error during prediction: {e}")
             raise
 
-
-# Streamlit Application
-def main():
-    """Main Streamlit application"""
+# Main application logic for Google Colab
+def main_colab():
+    """Main application logic adapted for Google Colab"""
     try:
-        st.set_page_config(page_title="TRIFUSION Forecasting", layout="wide")
-        st.title("📊 TRIFUSION Forecasting App with DOSM Data")
+        print("TRIFUSION Forecasting App with DOSM Data")
+        print("Enhanced with improved error handling, data validation, and PyTorch device compatibility\n")
         
         # Initialize device
         device = DeviceManager.get_device()
-        st.sidebar.info(f"Using device: {device}")
+        print(f"Using device: {device}")
         
-        # Sidebar for configuration
-        st.sidebar.header("Configuration")
-        sequence_length = st.sidebar.slider("Sequence Length", 5, 100, 30)
-        hidden_size = st.sidebar.slider("Hidden Size", 32, 256, 64)
-        num_layers = st.sidebar.slider("Number of LSTM Layers", 1, 3, 2)
-        epochs = st.sidebar.slider("Number of Epochs", 10, 200, 50)
-        batch_size = st.sidebar.slider("Batch Size", 8, 64, 32)
-        learning_rate = st.sidebar.number_input("Learning Rate", 0.0001, 0.01, 0.001)
+        # Configuration inputs
+        sequence_length = int(input("Enter sequence length (default 30): ") or 30)
+        hidden_size = int(input("Enter hidden size (default 64): ") or 64)
+        num_layers = int(input("Enter number of LSTM layers (default 2): ") or 2)
+        epochs = int(input("Enter number of epochs (default 50): ") or 50)
+        batch_size = int(input("Enter batch size (default 32): ") or 32)
+        learning_rate = float(input("Enter learning rate (default 0.001): ") or 0.001)
         
-        # File upload
-        st.sidebar.header("Data Upload")
-        uploaded_file = st.sidebar.file_uploader("Upload CSV file", type=['csv'])
+        # File upload simulation (in Colab, upload via files.upload())
+        from google.colab import files
+        uploaded = files.upload()
+        if not uploaded:
+            print("No file uploaded. Please upload a CSV file.")
+            return
         
-        if uploaded_file is not None:
-            try:
-                # Load and validate data
-                df = pd.read_csv(uploaded_file)
-                is_valid, msg = DataValidator.validate_dataframe(df)
-                
-                if not is_valid:
-                    st.error(f"Data validation failed: {msg}")
-                    return
-                
-                st.success("✓ Data uploaded and validated successfully")
-                st.write(f"Data shape: {df.shape}")
-                st.write(df.head())
-                
-                # Select target column
-                target_column = st.selectbox("Select target column for forecasting", df.columns)
-                
-                # Preprocess data
-                try:
-                    preprocessor = DataPreprocessor(sequence_length=sequence_length, device=device)
-                    processed_data = preprocessor.preprocess(df[target_column].values)
-                    X, y = preprocessor.create_sequences(processed_data)
-                    
-                    st.info(f"✓ Data preprocessed. Sequences created: X={X.shape}, y={y.shape}")
-                    
-                    # Split data
-                    train_size = int(len(X) * 0.8)
-                    X_train, X_val = X[:train_size], X[train_size:]
-                    y_train, y_val = y[:train_size], y[train_size:]
-                    
-                    # Create data loaders
-                    train_dataset = TensorDataset(
-                        torch.FloatTensor(X_train),
-                        torch.FloatTensor(y_train)
-                    )
-                    val_dataset = TensorDataset(
-                        torch.FloatTensor(X_val),
-                        torch.FloatTensor(y_val)
-                    )
-                    
-                    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-                    val_loader = DataLoader(val_dataset, batch_size=batch_size)
-                    
-                    st.info(f"✓ Data split: Train={len(X_train)}, Validation={len(X_val)}")
-                    
-                    # Initialize model and trainer
-                    model = LSTMModel(
-                        input_size=1,
-                        hidden_size=hidden_size,
-                        num_layers=num_layers,
-                        output_size=1,
-                        device=device
-                    )
-                    trainer = ModelTrainer(model, device=device, learning_rate=learning_rate)
-                    
-                    # Training progress
-                    st.header("Model Training")
-                    progress_bar = st.progress(0)
-                    loss_chart = st.empty()
-                    
-                    train_losses, val_losses = [], []
-                    
-                    for epoch in range(epochs):
-                        train_loss = trainer.train_epoch(train_loader)
-                        val_loss = trainer.evaluate(val_loader)
-                        
-                        train_losses.append(train_loss)
-                        val_losses.append(val_loss)
-                        
-                        progress_bar.progress((epoch + 1) / epochs)
-                        
-                        if (epoch + 1) % 10 == 0:
-                            st.write(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
-                    
-                    # Plot losses
-                    loss_df = pd.DataFrame({
-                        'Epoch': range(1, epochs + 1),
-                        'Train Loss': train_losses,
-                        'Validation Loss': val_losses
-                    })
-                    
-                    st.line_chart(loss_df.set_index('Epoch'))
-                    st.success("✓ Model training completed")
-                    
-                    # Make predictions
-                    st.header("Predictions")
-                    predictions_train = trainer.predict(X_train)
-                    predictions_val = trainer.predict(X_val)
-                    
-                    # Inverse transform predictions
-                    predictions_train_original = preprocessor.inverse_transform(predictions_train)
-                    predictions_val_original = preprocessor.inverse_transform(predictions_val)
-                    y_train_original = preprocessor.inverse_transform(y_train)
-                    y_val_original = preprocessor.inverse_transform(y_val)
-                    
-                    # Calculate metrics
-                    train_mse = mean_squared_error(y_train_original, predictions_train_original)
-                    train_mae = mean_absolute_error(y_train_original, predictions_train_original)
-                    train_r2 = r2_score(y_train_original, predictions_train_original)
-                    
-                    val_mse = mean_squared_error(y_val_original, predictions_val_original)
-                    val_mae = mean_absolute_error(y_val_original, predictions_val_original)
-                    val_r2 = r2_score(y_val_original, predictions_val_original)
-                    
-                    # Display metrics
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.subheader("Training Metrics")
-                        st.metric("MSE", f"{train_mse:.6f}")
-                        st.metric("MAE", f"{train_mae:.6f}")
-                        st.metric("R² Score", f"{train_r2:.6f}")
-                    
-                    with col2:
-                        st.subheader("Validation Metrics")
-                        st.metric("MSE", f"{val_mse:.6f}")
-                        st.metric("MAE", f"{val_mae:.6f}")
-                        st.metric("R² Score", f"{val_r2:.6f}")
-                    
-                    # Plot predictions vs actual
-                    st.subheader("Predictions vs Actual")
-                    
-                    results_df = pd.DataFrame({
-                        'Actual': np.concatenate([y_train_original.flatten(), y_val_original.flatten()]),
-                        'Predicted': np.concatenate([predictions_train_original.flatten(), predictions_val_original.flatten()]),
-                        'Set': ['Train'] * len(y_train_original) + ['Validation'] * len(y_val_original)
-                    })
-                    
-                    st.line_chart(results_df[['Actual', 'Predicted']])
-                    
-                except Exception as e:
-                    logger.error(f"Error during model training: {e}\n{traceback.format_exc()}")
-                    st.error(f"Error during model training: {str(e)}")
+        file_name = list(uploaded.keys())[0]
+        df = pd.read_csv(file_name)
         
-        else:
-            st.info("👈 Please upload a CSV file to begin")
+        # Validate DataFrame
+        is_valid, msg = DataValidator.validate_dataframe(df)
+        if not is_valid:
+            print(f"Data validation failed: {msg}")
+            return
+        
+        print("✓ Data uploaded and validated successfully")
+        print(f"Data shape: {df.shape}")
+        print(df.head())
+        
+        # Select target column
+        print("\nAvailable columns:", list(df.columns))
+        target_column = input("Enter target column for forecasting: ")
+        if target_column not in df.columns:
+            print("Invalid column selected.")
+            return
+        
+        # Preprocess data
+        try:
+            preprocessor = DataPreprocessor(sequence_length=sequence_length, device=device)
+            processed_data = preprocessor.preprocess(df[target_column].values)
+            X, y = preprocessor.create_sequences(processed_data)
+            
+            print(f"✓ Data preprocessed. Sequences created: X={X.shape}, y={y.shape}")
+            
+            # Split data
+            train_size = int(len(X) * 0.8)
+            X_train, X_val = X[:train_size], X[train_size:]
+            y_train, y_val = y[:train_size], y[train_size:]
+            
+            # Create data loaders
+            train_dataset = TensorDataset(
+                torch.FloatTensor(X_train),
+                torch.FloatTensor(y_train)
+            )
+            val_dataset = TensorDataset(
+                torch.FloatTensor(X_val),
+                torch.FloatTensor(y_val)
+            )
+            
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size)
+            
+            print(f"✓ Data split: Train={len(X_train)}, Validation={len(X_val)}")
+            
+            # Initialize model and trainer
+            model = LSTMModel(
+                input_size=1,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                output_size=1,
+                device=device
+            )
+            trainer = ModelTrainer(model, device=device, learning_rate=learning_rate)
+            
+            # Training
+            print("\nModel Training")
+            train_losses, val_losses = [], []
+            
+            for epoch in range(epochs):
+                train_loss = trainer.train_epoch(train_loader)
+                val_loss = trainer.evaluate(val_loader)
+                
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                
+                if (epoch + 1) % 10 == 0:
+                    print(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+            
+            # Plot losses
+            plt.figure(figsize=(10, 5))
+            plt.plot(range(1, epochs + 1), train_losses, label='Train Loss')
+            plt.plot(range(1, epochs + 1), val_losses, label='Validation Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.title('Training and Validation Losses')
+            plt.show()
+            
+            print("✓ Model training completed")
+            
+            # Make predictions
+            print("\nPredictions")
+            predictions_train = trainer.predict(X_train)
+            predictions_val = trainer.predict(X_val)
+            
+            # Inverse transform predictions
+            predictions_train_original = preprocessor.inverse_transform(predictions_train)
+            predictions_val_original = preprocessor.inverse_transform(predictions_val)
+            y_train_original = preprocessor.inverse_transform(y_train)
+            y_val_original = preprocessor.inverse_transform(y_val)
+            
+            # Calculate metrics
+            train_mse = mean_squared_error(y_train_original, predictions_train_original)
+            train_mae = mean_absolute_error(y_train_original, predictions_train_original)
+            train_r2 = r2_score(y_train_original, predictions_train_original)
+            
+            val_mse = mean_squared_error(y_val_original, predictions_val_original)
+            val_mae = mean_absolute_error(y_val_original, predictions_val_original)
+            val_r2 = r2_score(y_val_original, predictions_val_original)
+            
+            # Display metrics
+            print("\nTraining Metrics:")
+            print(f"MSE: {train_mse:.6f}")
+            print(f"MAE: {train_mae:.6f}")
+            print(f"R² Score: {train_r2:.6f}")
+            
+            print("\nValidation Metrics:")
+            print(f"MSE: {val_mse:.6f}")
+            print(f"MAE: {val_mae:.6f}")
+            print(f"R² Score: {val_r2:.6f}")
+            
+            # Plot predictions vs actual
+            plt.figure(figsize=(12, 6))
+            plt.plot(np.concatenate([y_train_original.flatten(), y_val_original.flatten()]), label="Actual")
+            plt.plot(np.concatenate([predictions_train_original.flatten(), predictions_val_original.flatten()]), label="Predicted")
+            plt.axvline(len(y_train_original), color='r', linestyle='--', label='Train/Val Split')
+            plt.xlabel('Time Steps')
+            plt.ylabel('Value')
+            plt.legend()
+            plt.title('Predictions vs Actual')
+            plt.show()
+            
+        except Exception as e:
+            logger.error(f"Error during model training: {e}\n{traceback.format_exc()}")
+            print(f"Error during model training: {str(e)}")
     
     except Exception as e:
         logger.error(f"Unexpected error in main: {e}\n{traceback.format_exc()}")
-        st.error(f"An unexpected error occurred: {str(e)}")
+        print(f"An unexpected error occurred: {str(e)}")
 
-
+# Run the app
 if __name__ == "__main__":
-    main()
+    main_colab()
