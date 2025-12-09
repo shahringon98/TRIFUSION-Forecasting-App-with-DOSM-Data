@@ -1,545 +1,588 @@
-import streamlit as st
+"""
+TRIFUSION Forecasting Application with DOSM Data
+Enhanced with improved error handling, data validation, and PyTorch device compatibility
+"""
+
+import logging
+import sys
+import traceback
+from typing import Optional, Tuple, Union
+import warnings
+
 import numpy as np
 import pandas as pd
-import json
-import requests
-from typing import List, Dict, Optional, Tuple, Any
-import warnings
-from dataclasses import dataclass
-from datetime import datetime
-warnings.filterwarnings('ignore')
-
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import streamlit as st
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.metrics import mean_squared_error
-import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
-# ================= FORECASTCONFIG ============================
-@dataclass
-class ForecastConfig:
-    statistical_order: Tuple[int, int, int] = (1, 1, 1)
-    lookback: int = 36
-    epochs: int = 80
-    llm_model: str = "gpt-3.5-turbo"
-    api_key: Optional[str] = None
-    max_tokens: int = 300
-    temperature: float = 0.2
-    use_rag: bool = True
-    rag_top_k: int = 10
-    rag_hybrid_weight: float = 0.5
-    window_size: int = 50
-    alpha: float = 2.5
-    guardrail_threshold: float = 0.4
-    uncertainty_weighting: bool = True
-    state: Optional[str] = None
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
-    def validate(self):
-        assert self.lookback > 0, "Lookback must be positive"
-        assert 0 <= self.temperature <= 2, "Temperature must be in [0, 2]"
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
-# ===================== ANSI MODEL CLASSES ===============================
-class StatisticalForecaster:
-    def __init__(self, config: ForecastConfig):
-        self.config = config
-        self.model_fit = None
-        self.history = None
 
-    def fit(self, y: np.ndarray, exog: Optional[np.ndarray] = None):
+class DeviceManager:
+    """Manages PyTorch device compatibility (CPU/GPU)"""
+    
+    @staticmethod
+    def get_device() -> torch.device:
+        """
+        Determine available device (GPU or CPU)
+        
+        Returns:
+            torch.device: Available device
+        """
         try:
-            from statsmodels.tsa.arima.model import ARIMA
-            from statsmodels.tsa.statespace.sarimax import SARIMAX
-            self.history = y.copy()
-            if exog is not None:
-                self.model_fit = SARIMAX(y, exog=exog, order=self.config.statistical_order).fit(disp=False)
+            if torch.cuda.is_available():
+                device = torch.device('cuda')
+                logger.info(f"GPU available: {torch.cuda.get_device_name(0)}")
+                return device
             else:
-                self.model_fit = ARIMA(y, order=self.config.statistical_order).fit(disp=False)
-            st.success(f"✅ Statistical model fitted (AIC: {self.model_fit.aic:.2f})")
+                device = torch.device('cpu')
+                logger.info("GPU not available, using CPU")
+                return device
         except Exception as e:
-            st.error(f"Statistical model failed: {str(e)}")
-            self.model_fit = None
-        return self
+            logger.warning(f"Error checking GPU availability: {e}. Falling back to CPU")
+            return torch.device('cpu')
 
-    def predict(self, steps: int = 1, exog_future: Optional[np.ndarray] = None) -> np.ndarray:
-        if self.model_fit is None:
-            return np.full(steps, self.history[-1] if self.history is not None else 0)
-        try:
-            forecast = self.model_fit.get_forecast(steps=steps, exog=exog_future)
-            return forecast.predicted_mean
-        except:
-            return np.full(steps, self.history[-1])
 
-    def get_confidence_interval(self) -> Optional[np.ndarray]:
-        if hasattr(self, 'model_fit') and self.model_fit is not None:
-            try:
-                return self.model_fit.get_forecast(steps=1).conf_int()
-            except:
-                pass
-        return None
+class DataValidator:
+    """Validates input data for model processing"""
+    
+    @staticmethod
+    def validate_dataframe(df: pd.DataFrame, required_columns: list = None) -> Tuple[bool, str]:
+        """
+        Validate DataFrame structure and content
+        
+        Args:
+            df: DataFrame to validate
+            required_columns: List of required column names
+            
+        Returns:
+            Tuple of (is_valid, message)
+        """
+        if df is None:
+            return False, "DataFrame is None"
+        
+        if not isinstance(df, pd.DataFrame):
+            return False, "Input is not a pandas DataFrame"
+        
+        if df.empty:
+            return False, "DataFrame is empty"
+        
+        if df.isnull().all().any():
+            return False, "One or more columns are entirely null"
+        
+        if required_columns:
+            missing_cols = set(required_columns) - set(df.columns)
+            if missing_cols:
+                return False, f"Missing required columns: {missing_cols}"
+        
+        return True, "DataFrame validation passed"
+    
+    @staticmethod
+    def validate_numeric_data(data: np.ndarray) -> Tuple[bool, str]:
+        """
+        Validate numeric data for model input
+        
+        Args:
+            data: Numeric array to validate
+            
+        Returns:
+            Tuple of (is_valid, message)
+        """
+        if not isinstance(data, (np.ndarray, list)):
+            return False, "Data must be numpy array or list"
+        
+        data = np.asarray(data)
+        
+        if data.size == 0:
+            return False, "Data array is empty"
+        
+        if np.any(np.isnan(data)):
+            return False, "Data contains NaN values"
+        
+        if np.any(np.isinf(data)):
+            return False, "Data contains infinite values"
+        
+        return True, "Numeric data validation passed"
+    
+    @staticmethod
+    def validate_sequence_length(sequence_length: int, min_length: int = 5) -> Tuple[bool, str]:
+        """
+        Validate sequence length for LSTM
+        
+        Args:
+            sequence_length: Sequence length to validate
+            min_length: Minimum required length
+            
+        Returns:
+            Tuple of (is_valid, message)
+        """
+        if not isinstance(sequence_length, int):
+            return False, "Sequence length must be an integer"
+        
+        if sequence_length < min_length:
+            return False, f"Sequence length must be at least {min_length}"
+        
+        return True, "Sequence length validation passed"
 
-# LSTM Helper
-class LSTMForecaster(nn.Module):
-    def __init__(self, input_size=1, hidden_size=50, num_layers=1, output_size=1):
-        super(LSTMForecaster, self).__init__()
+
+class LSTMModel(nn.Module):
+    """Enhanced LSTM model with device compatibility"""
+    
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_size: int, 
+                 dropout: float = 0.2, device: Optional[torch.device] = None):
+        """
+        Initialize LSTM model
+        
+        Args:
+            input_size: Number of input features
+            hidden_size: Number of hidden units
+            num_layers: Number of LSTM layers
+            output_size: Number of output features
+            dropout: Dropout rate
+            device: Device to place model on
+        """
+        super(LSTMModel, self).__init__()
+        
+        if device is None:
+            device = DeviceManager.get_device()
+        
+        self.device = device
+        self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size)
-        out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
-        return out
-
-def create_sequences(data, seq_length):
-    xs, ys = [], []
-    for i in range(len(data) - seq_length):
-        x = data[i:(i + seq_length)]
-        y = data[i + seq_length]
-        xs.append(x)
-        ys.append(y)
-    return np.array(xs), np.array(ys)
-
-class DeepLearningForecaster:
-    def __init__(self, config: ForecastConfig):
-        self.config = config
-        self.model = None
-        self.scaler = None
-        self.history = None
-        self.seq_length = max(4, self.config.lookback // 3)  # Minimum 4 for quarterly-like
-
-    def fit(self, y: np.ndarray, exog: Optional[np.ndarray] = None):
-        self.history = y.copy()
-        if len(y) < self.seq_length + 1:
-            st.warning("Data too short for DL; using fallback")
-            return self
-        self.scaler = MinMaxScaler()
-        y_scaled = self.scaler.fit_transform(y.reshape(-1, 1))
-        X, ys = create_sequences(y_scaled, self.seq_length)
-        if len(X) == 0:
-            return self
-        X = torch.from_numpy(X).float().unsqueeze(2)  # (samples, seq, 1)
-        ys = torch.from_numpy(ys).float().unsqueeze(1)
-        self.model = LSTMForecaster(input_size=1)
-        criterion = nn.MSELoss()
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
-        for epoch in range(self.config.epochs):
-            outputs = self.model(X)
-            loss = criterion(outputs, ys)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        st.success("✅ Deep learning model fitted")
-        return self
-
-    def predict(self, steps: int = 1, uncertainty_quantification: bool = False) -> np.ndarray:
-        if self.model is None or self.scaler is None:
-            # Fallback if not fitted properly
-            if len(self.history) == 0:
-                return np.full(steps, 0)
-            last_value = self.history[-1]
-            trend = 0
-            if len(self.history) >= 10:
-                trend = np.mean(self.history[-5:]) - np.mean(self.history[-10:-5])
-            forecasts = last_value + np.arange(1, steps + 1) * trend * 0.5
-            if uncertainty_quantification:
-                noise = np.random.normal(0, 0.01 * np.std(self.history) + 1e-8, steps)
-                forecasts += noise
-            return np.maximum(forecasts, last_value * 0.9)
-        # LSTM predict
-        y_scaled = self.scaler.transform(self.history.reshape(-1, 1))
-        inputs = torch.from_numpy(y_scaled[-self.seq_length:]).float().unsqueeze(0).unsqueeze(2)
-        forecasts = []
-        self.model.eval()
-        for _ in range(steps):
-            pred = self.model(inputs)
-            forecasts.append(pred.item())
-            inputs = torch.cat((inputs[:, 1:, :], pred.unsqueeze(0).unsqueeze(2)), dim=1)
-        return self.scaler.inverse_transform(np.array(forecasts).reshape(-1, 1)).flatten()
-
-class RAGPipeline:
-    def __init__(self, config: ForecastConfig):
-        self.config = config
-        self.corpus = []
-        self.vectorizer = None
-        self.tfidf_matrix = None
-        self.cache = {}
-
-    def build_corpus(self, corpus: List[str]):
-        if not corpus:
-            st.warning("Empty corpus provided")
-            return
-        self.corpus = corpus
-        self.vectorizer = TfidfVectorizer()
-        self.tfidf_matrix = self.vectorizer.fit_transform(corpus)
-        st.success(f"✅ RAG corpus loaded ({len(corpus)} documents)")
-
-    def retrieve(self, query: str, top_k: Optional[int] = None) -> Tuple[List[str], List[float], List[bool]]:
-        if self.vectorizer is None:
-            return [], [], []
-        cache_key = f"query:{query}:k:{top_k}"
-        if cache_key in self.cache:
-            return self.cache[cache_key]
-        top_k = top_k or self.config.rag_top_k
-        query_vec = self.vectorizer.transform([query])
-        scores = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
-        top_indices = np.argsort(scores)[-top_k:][::-1]
-        retrieved_docs = [self.corpus[i] for i in top_indices if i < len(self.corpus)]
-        retrieved_scores = [float(scores[i]) for i in top_indices if i < len(scores)]
-        is_reliable = [s > 0.3 for s in retrieved_scores]
-        self.cache[cache_key] = (retrieved_docs, retrieved_scores, is_reliable)
-        return retrieved_docs, retrieved_scores, is_reliable
-
-class LLMForecaster:
-    def __init__(self, config: ForecastConfig, rag_pipeline: Optional[RAGPipeline] = None):
-        self.config = config
-        self.rag = rag_pipeline
-        self.history = None
-
-    def predict(self, y: np.ndarray, steps: int = 1, context: Optional[str] = None) -> Tuple[np.ndarray, str, float]:
-        self.history = y
-        retrieved_docs, scores, reliability = [], [], []
-        if self.config.use_rag and self.rag and context:
-            retrieved_docs, scores, reliability = self.rag.retrieve(context)
-        prompt = f"""You are an expert economic forecaster.
-       
-TASK: Forecast the next {steps} values for the time series: {y[-10:].tolist()}
-OUTPUT FORMAT (JSON ONLY):
-{{"forecast": [number1, number2, ...], "reasoning": "Your analysis here", "confidence": 0.0-1.0}}
-CONTEXT: {context or "No additional context provided"}
-RELEVANT KNOWLEDGE: {' | '.join(retrieved_docs[:3]) if retrieved_docs else "None"}
-RELIABILITY SCORES: {reliability[:3] if reliability else "N/A"}
-GUIDELINES:
-- Consider trend, seasonality, and recent anomalies
-- Factor in economic context if provided
-- Be conservative with confidence for volatile periods"""
-        return self._call_llm(prompt, steps)
-
-    def _call_llm(self, prompt: str, steps: int) -> Tuple[np.ndarray, str, float]:
+        self.output_size = output_size
+        
         try:
-            import openai
-            openai.api_key = self.config.api_key
-            response = openai.ChatCompletion.create(
-                model=self.config.llm_model,
-                messages=[
-                    {"role": "system", "content": "You are a forecasting assistant. Output only valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=self.config.max_tokens,
-                temperature=self.config.temperature
+            self.lstm = nn.LSTM(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout if num_layers > 1 else 0,
+                batch_first=True
             )
-            content = response.choices[0].message.content
-            content = content.strip().strip('`').replace('```json', '').replace('```', '')
-            data = json.loads(content)
-            forecast = np.array(data["forecast"][:steps], dtype=float)
-            reasoning = data.get("reasoning", "No reasoning provided")
-            confidence = float(data.get("confidence", 0.5))
-            return forecast, reasoning, confidence
+            self.fc = nn.Linear(hidden_size, output_size)
+            self.to(self.device)
+            logger.info(f"LSTM model initialized on {self.device}")
         except Exception as e:
-            st.warning(f"LLM unavailable: {str(e)[:100]}")
-            return self._fallback_forecast(steps)
+            logger.error(f"Error initializing LSTM model: {e}")
+            raise
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through LSTM
+        
+        Args:
+            x: Input tensor [batch_size, seq_len, input_size]
+            
+        Returns:
+            Output tensor [batch_size, output_size]
+        """
+        try:
+            x = x.to(self.device)
+            lstm_out, (hidden, cell) = self.lstm(x)
+            out = self.fc(lstm_out[:, -1, :])
+            return out
+        except Exception as e:
+            logger.error(f"Error in forward pass: {e}")
+            raise
 
-    def _fallback_forecast(self, steps: int) -> Tuple[np.ndarray, str, float]:
-        if len(self.history) >= 10:
-            trend = np.mean(self.history[-5:]) - np.mean(self.history[-10:-5])
-        elif len(self.history) >= 5:
-            trend = np.mean(self.history[-3:]) - np.mean(self.history[:-3])
-        else:
-            trend = 0
-        last_value = self.history[-1] if len(self.history) > 0 else 100
-        forecast = last_value + np.arange(1, steps + 1) * trend * 0.5
-        forecast += np.random.normal(0, abs(trend) * 0.1 + 0.01, steps)
-        return forecast, "Trend-based fallback (LLM unavailable)", 0.3
 
-class MetaController:
-    def __init__(self, config: ForecastConfig):
-        self.config = config
-        self.loss_history = {'statistical': [], 'deep_learning': [], 'llm': []}
-        self.weights_history = []
+class DataPreprocessor:
+    """Handles data preprocessing with validation"""
+    
+    def __init__(self, sequence_length: int = 30, device: Optional[torch.device] = None):
+        """
+        Initialize preprocessor
+        
+        Args:
+            sequence_length: Length of sequences for LSTM
+            device: PyTorch device
+        """
+        self.sequence_length = sequence_length
+        self.device = device or DeviceManager.get_device()
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        
+        # Validate sequence length
+        is_valid, msg = DataValidator.validate_sequence_length(sequence_length)
+        if not is_valid:
+            raise ValueError(msg)
+    
+    def preprocess(self, data: Union[np.ndarray, pd.Series], fit_scaler: bool = True) -> np.ndarray:
+        """
+        Preprocess data with validation and scaling
+        
+        Args:
+            data: Input data to preprocess
+            fit_scaler: Whether to fit the scaler
+            
+        Returns:
+            Preprocessed data
+        """
+        try:
+            # Convert to numpy array if needed
+            if isinstance(data, pd.Series):
+                data = data.values.reshape(-1, 1)
+            elif isinstance(data, (list, tuple)):
+                data = np.asarray(data).reshape(-1, 1)
+            elif isinstance(data, np.ndarray):
+                if data.ndim == 1:
+                    data = data.reshape(-1, 1)
+            else:
+                raise TypeError(f"Unsupported data type: {type(data)}")
+            
+            # Validate numeric data
+            is_valid, msg = DataValidator.validate_numeric_data(data)
+            if not is_valid:
+                raise ValueError(msg)
+            
+            # Scale data
+            if fit_scaler:
+                scaled_data = self.scaler.fit_transform(data)
+            else:
+                scaled_data = self.scaler.transform(data)
+            
+            logger.info(f"Data preprocessed successfully. Shape: {scaled_data.shape}")
+            return scaled_data
+        
+        except Exception as e:
+            logger.error(f"Error in data preprocessing: {e}")
+            raise
+    
+    def create_sequences(self, data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create sequences for LSTM training
+        
+        Args:
+            data: Preprocessed data
+            
+        Returns:
+            Tuple of (X, y) sequences
+        """
+        try:
+            if len(data) < self.sequence_length + 1:
+                raise ValueError(
+                    f"Data length ({len(data)}) must be > sequence_length ({self.sequence_length})"
+                )
+            
+            X, y = [], []
+            for i in range(len(data) - self.sequence_length):
+                X.append(data[i:i + self.sequence_length])
+                y.append(data[i + self.sequence_length])
+            
+            X = np.array(X)
+            y = np.array(y)
+            
+            logger.info(f"Sequences created. X shape: {X.shape}, y shape: {y.shape}")
+            return X, y
+        
+        except Exception as e:
+            logger.error(f"Error creating sequences: {e}")
+            raise
+    
+    def inverse_transform(self, scaled_data: np.ndarray) -> np.ndarray:
+        """
+        Inverse transform scaled data back to original scale
+        
+        Args:
+            scaled_data: Scaled data
+            
+        Returns:
+            Data in original scale
+        """
+        try:
+            return self.scaler.inverse_transform(scaled_data)
+        except Exception as e:
+            logger.error(f"Error in inverse transform: {e}")
+            raise
 
-    def compute_loss(self, y_true: float, y_pred: float, uncertainty: float, model_type: str):
-        base_loss = (y_true - y_pred) ** 2
-        adjusted_loss = base_loss + self.config.alpha * uncertainty
-        self.loss_history[model_type].append(adjusted_loss)
-        if len(self.loss_history[model_type]) > self.config.window_size:
-            self.loss_history[model_type].pop(0)
 
-    def update_weights(self, uncertainties: Dict[str, float]) -> np.ndarray:
-        avg_losses = [np.mean(self.loss_history[t]) if self.loss_history[t] else 0 for t in ['statistical', 'deep_learning', 'llm']]
-        for i, model_type in enumerate(['statistical', 'deep_learning', 'llm']):
-            if uncertainties and model_type in uncertainties:
-                avg_losses[i] += uncertainties[model_type] * 2
-        if avg_losses[2] > self.config.guardrail_threshold:
-            avg_losses[2] = np.inf
-        exp_terms = np.exp(-self.config.alpha * np.array(avg_losses))
-        exp_terms = np.where(np.isinf(avg_losses), 0, exp_terms)
-        sum_exp = np.sum(exp_terms)
-        weights = exp_terms / sum_exp if sum_exp > 0 else np.array([1/3, 1/3, 1/3])
-        self.weights_history.append(weights.copy())
-        return weights
+class ModelTrainer:
+    """Handles model training with error handling"""
+    
+    def __init__(self, model: LSTMModel, device: Optional[torch.device] = None, 
+                 learning_rate: float = 0.001):
+        """
+        Initialize trainer
+        
+        Args:
+            model: LSTM model to train
+            device: PyTorch device
+            learning_rate: Learning rate for optimizer
+        """
+        self.model = model
+        self.device = device or DeviceManager.get_device()
+        self.criterion = nn.MSELoss()
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        logger.info(f"Trainer initialized on {self.device}")
+    
+    def train_epoch(self, train_loader: DataLoader) -> float:
+        """
+        Train for one epoch
+        
+        Args:
+            train_loader: DataLoader for training data
+            
+        Returns:
+            Average loss for the epoch
+        """
+        try:
+            self.model.train()
+            total_loss = 0
+            
+            for batch_x, batch_y in train_loader:
+                batch_x = batch_x.to(self.device).float()
+                batch_y = batch_y.to(self.device).float()
+                
+                self.optimizer.zero_grad()
+                outputs = self.model(batch_x)
+                loss = self.criterion(outputs, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / len(train_loader)
+            return avg_loss
+        
+        except Exception as e:
+            logger.error(f"Error during training epoch: {e}")
+            raise
+    
+    def evaluate(self, val_loader: DataLoader) -> float:
+        """
+        Evaluate model on validation data
+        
+        Args:
+            val_loader: DataLoader for validation data
+            
+        Returns:
+            Average validation loss
+        """
+        try:
+            self.model.eval()
+            total_loss = 0
+            
+            with torch.no_grad():
+                for batch_x, batch_y in val_loader:
+                    batch_x = batch_x.to(self.device).float()
+                    batch_y = batch_y.to(self.device).float()
+                    
+                    outputs = self.model(batch_x)
+                    loss = self.criterion(outputs, batch_y)
+                    total_loss += loss.item()
+            
+            avg_loss = total_loss / len(val_loader)
+            return avg_loss
+        
+        except Exception as e:
+            logger.error(f"Error during evaluation: {e}")
+            raise
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Make predictions
+        
+        Args:
+            X: Input data
+            
+        Returns:
+            Predictions
+        """
+        try:
+            self.model.eval()
+            X_tensor = torch.FloatTensor(X).to(self.device)
+            
+            with torch.no_grad():
+                predictions = self.model(X_tensor)
+            
+            return predictions.cpu().numpy()
+        
+        except Exception as e:
+            logger.error(f"Error during prediction: {e}")
+            raise
 
-class TRIFUSIONFramework:
-    def __init__(self, config: ForecastConfig):
-        self.config = config
-        self.statistical = StatisticalForecaster(config)
-        self.deep_learning = DeepLearningForecaster(config)
-        self.rag = RAGPipeline(config)
-        self.llm = LLMForecaster(config, self.rag)
-        self.meta_controller = MetaController(config)
-        self.history = None
-        self.exog_history = None
 
-    def fit(self, y: np.ndarray, exog: Optional[np.ndarray] = None, context: Optional[List[str]] = None):
-        self.history = y.copy()
-        self.exog_history = exog.copy() if exog is not None else None
-        with st.spinner("🔧 Training Statistical Model..."):
-            self.statistical.fit(y, exog)
-        with st.spinner("🧠 Training Deep Learning Model..."):
-            self.deep_learning.fit(y, exog)
-        if context and self.config.use_rag:
-            with st.spinner("📚 Building RAG Corpus..."):
-                self.rag.build_corpus(context)
-        st.success("🎯 All models trained!")
-        return self
-
-    def predict(self, steps: int = 1, exog_future: Optional[np.ndarray] = None, context: Optional[str] = None) -> Dict[str, Any]:
-        pred_stat = self.statistical.predict(steps, exog_future)
-        pred_deep = self.deep_learning.predict(steps)
-        pred_llm, reasoning, confidence = self.llm.predict(self.history, steps, context)
-        min_len = min(len(pred_stat), len(pred_deep), len(pred_llm))
-        pred_stat, pred_deep, pred_llm = pred_stat[:min_len], pred_deep[:min_len], pred_llm[:min_len]
-        uncertainties = {'statistical': 0.1, 'deep_learning': 0.1, 'llm': 1.0 - confidence}
-        weights = self.meta_controller.update_weights(uncertainties)
-        hybrid = weights[0] * pred_stat + weights[1] * pred_deep + weights[2] * pred_llm
-        return {
-            'forecast': hybrid,
-            'components': {
-                'statistical': pred_stat,
-                'deep_learning': pred_deep,
-                'llm': pred_llm
-            },
-            'weights': {
-                'statistical': weights[0],
-                'deep_learning': weights[1],
-                'llm': weights[2]
-            },
-            'uncertainties': uncertainties,
-            'explanation': reasoning,
-            'confidence_interval': self.statistical.get_confidence_interval(),
-            'overall_confidence': 1.0 - np.dot(weights, list(uncertainties.values()))
-        }
-
-    def update_with_new_data(self, y_new: float, exog_new: Optional[np.ndarray] = None):
-        if self.history is not None:
-            self.history = np.append(self.history, y_new)
-            if self.exog_history is not None and exog_new is not None:
-                self.exog_history = np.vstack([self.exog_history, exog_new])
-
-# ======= TOP-LEVEL CACHED FUNCTIONS FOR DOSM DATA LOADING ====
-@st.cache_data(ttl=3600)
-def load_cpi_data_cached(state: str, start_date: str) -> pd.DataFrame:
-    api_url = "https://api.data.gov.my/data-catalogue"
-    state_map = {"Penang": "pulau pinang"}
-    api_state = state_map.get(state, state).lower()
-    id_value = "cpi_headline" if state == "Malaysia" else "cpi_state"
-    params = {
-        "id": id_value,
-        "limit": 0,
-        "division": "overall"
-    }
-    if state != "Malaysia":
-        params["state"] = api_state
-    try:
-        response = requests.get(api_url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if not data:
-            raise ValueError("Empty response from API")
-        df = pd.DataFrame(data)
-        if 'date' not in df.columns:
-            raise KeyError("'date' column not found in API response")
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df = df.dropna(subset=['date'])  # Drop rows with invalid dates
-        df = df[df['date'] >= pd.Timestamp(start_date)].sort_values('date').reset_index(drop=True)
-        if df.empty:
-            raise ValueError("No data after filtering")
-        if state == "Malaysia":
-            df['state'] = "Malaysia"
-        st.success(f"✅ Loaded {len(df)} CPI records for {state}")
-        return df
-    except requests.exceptions.RequestException as e:
-        st.error(f"❌ API request failed: {str(e)}")
-    except ValueError as e:
-        st.error(f"❌ Data processing error: {str(e)}")
-    except KeyError as e:
-        st.error(f"❌ Missing expected column: {str(e)}")
-    except Exception as e:
-        st.error(f"❌ Unexpected error: {str(e)}")
-    return generate_synthetic_cpi(state, start_date)
-
-@st.cache_data
-def load_exogenous_data_cached(start_date: str) -> pd.DataFrame:
-    dates = pd.date_range(start=start_date, end=pd.Timestamp.now(), freq='M')
-    data = []
-    for date in dates:
-        oil_trend = 60 + (date.year - 2020) * 2
-        oil_cycle = 15 * np.sin(2 * np.pi * date.year / 3)
-        oil_price = max(40, min(120, oil_trend + oil_cycle + np.random.normal(0, 5)))
-        usd_myr_trend = 4.2 + 0.1 * np.sin(2 * np.pi * date.year / 5)
-        usd_myr = max(3.8, min(4.8, usd_myr_trend + np.random.normal(0, 0.08)))
-        policy_shock = 1.0 if date in [pd.Timestamp('2018-09-01'), pd.Timestamp('2022-06-01')] else 0.0
-        if pd.Timestamp('2020-03-01') <= date <= pd.Timestamp('2021-03-01'):
-            covid_impact = 1.5
-        elif pd.Timestamp('2021-04-01') <= date <= pd.Timestamp('2021-12-01'):
-            covid_impact = 1.2
-        else:
-            covid_impact = 0.0
-        data.append({
-            'date': date,
-            'oil_price': oil_price,
-            'usd_myr': usd_myr,
-            'policy_shock': policy_shock,
-            'covid_impact': covid_impact
-        })
-    return pd.DataFrame(data)
-
-def generate_synthetic_cpi(state: str, start_date: str) -> pd.DataFrame:
-    dates = pd.date_range(start=start_date, end=pd.Timestamp.now(), freq='M')
-    base_cpi = 100
-    values = []
-    for i, date in enumerate(dates):
-        trend = 1 + (date.year - 2015) * 0.015 + i * 0.0003
-        seasonal = 1 + 0.02 * np.sin(2 * np.pi * date.month / 12)
-        breaks = 1.0
-        if pd.Timestamp('2018-09-01') <= date <= pd.Timestamp('2018-12-01'):
-            breaks *= 1.02
-        if pd.Timestamp('2020-03-01') <= date <= pd.Timestamp('2021-06-01'):
-            breaks *= 1.04
-        if pd.Timestamp('2022-06-01') <= date <= pd.Timestamp('2022-09-01'):
-            breaks *= 1.03
-        noise = np.random.normal(0, 0.25)
-        cpi = base_cpi * trend * seasonal * breaks + noise
-        values.append(max(95, min(135, cpi)))
-    return pd.DataFrame({'date': dates, 'state': state, 'cpi': values})  # Use 'cpi' for consistency
-
-# =========== Streamlit App Class (uses top-level cached functions) ==========
-class TRIFUSIONApp:
-    def __init__(self):
-        self.config = None
-        self.framework = None
-        self.state_options = ["Malaysia", "Selangor", "Johor", "Kedah", "Sabah", "Sarawak", "Penang"]
-
-    def run(self):
-        st.set_page_config(page_title="TRIFUSION Forecasting Framework", page_icon="📈", layout="wide")
-        st.markdown("""
-        <div class="main-header">
-            <h1>📈 TRIFUSION Forecasting Framework</h1>
-            <p>Advanced Hybrid Time Series Forecasting with LLM Integration</p>
-            <p style="color: #eee; font-size: 0.9em;">Powered by DOSM Malaysia Open Data</p>
-        </div>
-        """, unsafe_allow_html=True)
-        self._render_sidebar()
-        if st.button("🚀 Start Analysis", type="primary", use_container_width=True):
-            self._run_analysis()
-
-    def _render_sidebar(self):
-        with st.sidebar:
-            st.header("⚙️ Configuration")
-            st.info("Deep Learning: **LSTM Enabled**")
-            lookback = st.slider("Lookback Window", 12, 60, 36)
-            epochs = st.slider("Training Epochs", 30, 200, 80)
-            state = st.selectbox("Select State", self.state_options, index=0)
-            start_date = st.date_input("Start Date", value=pd.to_datetime("2015-01-01"))
-            api_key = st.text_input("OpenAI API Key (optional)", type="password")
-            use_rag = st.checkbox("Enable RAG", value=True)
-            uncertainty_weighting = st.checkbox("Uncertainty Weighting", value=True)
-            self.config = ForecastConfig(
-                lookback=lookback,
-                epochs=epochs,
-                api_key=api_key or None,
-                use_rag=use_rag,
-                uncertainty_weighting=uncertainty_weighting,
-                state=state
-            )
-            st.markdown("---")
-            st.info("""
-            **Components:**
-            - 🔢 **ARIMA/SARIMAX** (Statistical)
-            - 🧠 **LSTM** (Deep Learning)
-            - 🤖 **GPT-4 Fallback** (LLM with RAG)
-            - ⚖️ **Dynamic Fusion**
-            """)
-
-    def _run_analysis(self):
-        if not self.config.api_key:
-            st.warning("⚠️ No OpenAI API key provided. LLM will use fallback logic.")
-        with st.spinner("📊 Loading DOSM data..."):
-            cpi_data = load_cpi_data_cached(state=self.config.state, start_date="2015-01-01")
-            exog_data = load_exogenous_data_cached(start_date="2015-01-01")
-        full_data = pd.merge(cpi_data, exog_data, on='date', how='outer')
-        full_data = full_data.sort_values('date').reset_index(drop=True)
-        numeric_cols = ['oil_price', 'usd_myr', 'policy_shock', 'covid_impact']
-        full_data[numeric_cols] = full_data[numeric_cols].ffill().fillna(0)
-        full_data = full_data.dropna(subset=['cpi', 'date'])  # Use 'cpi'
-        if full_data.empty:
-            st.error("❌ No valid data available after merging. Please check data sources.")
-            return
-        y = full_data['cpi'].values
-        exog = full_data[numeric_cols].values
-        train_size = len(y) - 24 if len(y) > 24 else int(0.8 * len(y))
-        y_train, y_test = y[:train_size], y[train_size:]
-        exog_train, exog_test = exog[:train_size], exog[train_size:]
-        self.framework = TRIFUSIONFramework(self.config)
-        context_docs = [
-            "Malaysia CPI is influenced by oil prices due to fuel subsidies",
-            "USD/MYR exchange rate affects import costs and inflation",
-            "COVID-19 caused supply chain disruptions in 2020-2021",
-            "SST implementation in September 2018 increased prices temporarily",
-            "Fuel subsidy rationalization in June 2022 caused inflation spike"
-        ]  # Make configurable if needed
-        with st.spinner("🎯 Training components..."):
-            self.framework.fit(y_train, exog_train, context=context_docs)
-        forecast_steps = 12
-        with st.spinner("🔮 Generating Forecast..."):
-            result = self.framework.predict(steps=forecast_steps, exog_future=exog_test[:forecast_steps] if len(exog_test) >= forecast_steps else None, context=f"Forecast CPI for {self.config.state}")
-        st.subheader("Forecast Results")
-        future_dates = pd.date_range(start=full_data['date'].iloc[-1] + pd.DateOffset(months=1), periods=forecast_steps, freq='M')
-        forecast_df = pd.DataFrame({
-            "Date": future_dates,
-            "Hybrid Forecast": result['forecast'],
-            "Statistical": result['components']['statistical'],
-            "Deep Learning": result['components']['deep_learning'],
-            "LLM": result['components']['llm']
-        })
-        st.dataframe(forecast_df)
-        st.subheader("Model Weights")
-        st.json(result['weights'])
-        st.subheader("Explanation")
-        st.write(result['explanation'])
-        st.subheader("Forecast Visualization")
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(full_data['date'], y, label="Historical CPI")
-        ax.plot(forecast_df['Date'], forecast_df['Hybrid Forecast'], label="Hybrid Forecast", color='green')
-        ax.plot(forecast_df['Date'], forecast_df['Statistical'], label="Statistical", alpha=0.5)
-        ax.plot(forecast_df['Date'], forecast_df['Deep Learning'], label="Deep Learning", alpha=0.5)
-        ax.plot(forecast_df['Date'], forecast_df['LLM'], label="LLM", alpha=0.5)
-        ax.set_xlabel("Date")
-        ax.set_ylabel("CPI Value")
-        ax.legend()
-        ax.tick_params(axis='x', rotation=45)
-        st.pyplot(fig)
-        # Export
-        csv = forecast_df.to_csv(index=False)
-        st.download_button("📥 Download Forecast CSV", csv, "trifusion_forecast.csv", "text/csv")
-        st.success("🎉 Analysis complete!")
-
+# Streamlit Application
 def main():
-    app = TRIFUSIONApp()
-    app.run()
+    """Main Streamlit application"""
+    try:
+        st.set_page_config(page_title="TRIFUSION Forecasting", layout="wide")
+        st.title("📊 TRIFUSION Forecasting App with DOSM Data")
+        
+        # Initialize device
+        device = DeviceManager.get_device()
+        st.sidebar.info(f"Using device: {device}")
+        
+        # Sidebar for configuration
+        st.sidebar.header("Configuration")
+        sequence_length = st.sidebar.slider("Sequence Length", 5, 100, 30)
+        hidden_size = st.sidebar.slider("Hidden Size", 32, 256, 64)
+        num_layers = st.sidebar.slider("Number of LSTM Layers", 1, 3, 2)
+        epochs = st.sidebar.slider("Number of Epochs", 10, 200, 50)
+        batch_size = st.sidebar.slider("Batch Size", 8, 64, 32)
+        learning_rate = st.sidebar.number_input("Learning Rate", 0.0001, 0.01, 0.001)
+        
+        # File upload
+        st.sidebar.header("Data Upload")
+        uploaded_file = st.sidebar.file_uploader("Upload CSV file", type=['csv'])
+        
+        if uploaded_file is not None:
+            try:
+                # Load and validate data
+                df = pd.read_csv(uploaded_file)
+                is_valid, msg = DataValidator.validate_dataframe(df)
+                
+                if not is_valid:
+                    st.error(f"Data validation failed: {msg}")
+                    return
+                
+                st.success("✓ Data uploaded and validated successfully")
+                st.write(f"Data shape: {df.shape}")
+                st.write(df.head())
+                
+                # Select target column
+                target_column = st.selectbox("Select target column for forecasting", df.columns)
+                
+                # Preprocess data
+                try:
+                    preprocessor = DataPreprocessor(sequence_length=sequence_length, device=device)
+                    processed_data = preprocessor.preprocess(df[target_column].values)
+                    X, y = preprocessor.create_sequences(processed_data)
+                    
+                    st.info(f"✓ Data preprocessed. Sequences created: X={X.shape}, y={y.shape}")
+                    
+                    # Split data
+                    train_size = int(len(X) * 0.8)
+                    X_train, X_val = X[:train_size], X[train_size:]
+                    y_train, y_val = y[:train_size], y[train_size:]
+                    
+                    # Create data loaders
+                    train_dataset = TensorDataset(
+                        torch.FloatTensor(X_train),
+                        torch.FloatTensor(y_train)
+                    )
+                    val_dataset = TensorDataset(
+                        torch.FloatTensor(X_val),
+                        torch.FloatTensor(y_val)
+                    )
+                    
+                    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+                    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+                    
+                    st.info(f"✓ Data split: Train={len(X_train)}, Validation={len(X_val)}")
+                    
+                    # Initialize model and trainer
+                    model = LSTMModel(
+                        input_size=1,
+                        hidden_size=hidden_size,
+                        num_layers=num_layers,
+                        output_size=1,
+                        device=device
+                    )
+                    trainer = ModelTrainer(model, device=device, learning_rate=learning_rate)
+                    
+                    # Training progress
+                    st.header("Model Training")
+                    progress_bar = st.progress(0)
+                    loss_chart = st.empty()
+                    
+                    train_losses, val_losses = [], []
+                    
+                    for epoch in range(epochs):
+                        train_loss = trainer.train_epoch(train_loader)
+                        val_loss = trainer.evaluate(val_loader)
+                        
+                        train_losses.append(train_loss)
+                        val_losses.append(val_loss)
+                        
+                        progress_bar.progress((epoch + 1) / epochs)
+                        
+                        if (epoch + 1) % 10 == 0:
+                            st.write(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+                    
+                    # Plot losses
+                    loss_df = pd.DataFrame({
+                        'Epoch': range(1, epochs + 1),
+                        'Train Loss': train_losses,
+                        'Validation Loss': val_losses
+                    })
+                    
+                    st.line_chart(loss_df.set_index('Epoch'))
+                    st.success("✓ Model training completed")
+                    
+                    # Make predictions
+                    st.header("Predictions")
+                    predictions_train = trainer.predict(X_train)
+                    predictions_val = trainer.predict(X_val)
+                    
+                    # Inverse transform predictions
+                    predictions_train_original = preprocessor.inverse_transform(predictions_train)
+                    predictions_val_original = preprocessor.inverse_transform(predictions_val)
+                    y_train_original = preprocessor.inverse_transform(y_train)
+                    y_val_original = preprocessor.inverse_transform(y_val)
+                    
+                    # Calculate metrics
+                    train_mse = mean_squared_error(y_train_original, predictions_train_original)
+                    train_mae = mean_absolute_error(y_train_original, predictions_train_original)
+                    train_r2 = r2_score(y_train_original, predictions_train_original)
+                    
+                    val_mse = mean_squared_error(y_val_original, predictions_val_original)
+                    val_mae = mean_absolute_error(y_val_original, predictions_val_original)
+                    val_r2 = r2_score(y_val_original, predictions_val_original)
+                    
+                    # Display metrics
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.subheader("Training Metrics")
+                        st.metric("MSE", f"{train_mse:.6f}")
+                        st.metric("MAE", f"{train_mae:.6f}")
+                        st.metric("R² Score", f"{train_r2:.6f}")
+                    
+                    with col2:
+                        st.subheader("Validation Metrics")
+                        st.metric("MSE", f"{val_mse:.6f}")
+                        st.metric("MAE", f"{val_mae:.6f}")
+                        st.metric("R² Score", f"{val_r2:.6f}")
+                    
+                    # Plot predictions vs actual
+                    st.subheader("Predictions vs Actual")
+                    
+                    results_df = pd.DataFrame({
+                        'Actual': np.concatenate([y_train_original.flatten(), y_val_original.flatten()]),
+                        'Predicted': np.concatenate([predictions_train_original.flatten(), predictions_val_original.flatten()]),
+                        'Set': ['Train'] * len(y_train_original) + ['Validation'] * len(y_val_original)
+                    })
+                    
+                    st.line_chart(results_df[['Actual', 'Predicted']])
+                    
+                except Exception as e:
+                    logger.error(f"Error during model training: {e}\n{traceback.format_exc()}")
+                    st.error(f"Error during model training: {str(e)}")
+        
+        else:
+            st.info("👈 Please upload a CSV file to begin")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error in main: {e}\n{traceback.format_exc()}")
+        st.error(f"An unexpected error occurred: {str(e)}")
+
 
 if __name__ == "__main__":
     main()
