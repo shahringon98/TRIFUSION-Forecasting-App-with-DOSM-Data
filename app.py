@@ -2,6 +2,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import json
+import requests
 from typing import List, Dict, Optional, Tuple, Any
 import warnings
 from dataclasses import dataclass
@@ -98,7 +99,7 @@ def create_sequences(data, seq_length):
     xs, ys = [], []
     for i in range(len(data) - seq_length):
         x = data[i:(i + seq_length)]
-        y = data[i + seq_length]
+        y = data[i + seq_length, 0]
         xs.append(x)
         ys.append(y)
     return np.array(xs), np.array(ys)
@@ -117,12 +118,12 @@ class DeepLearningForecaster:
             st.warning("Data too short for DL; using fallback")
             return self
         self.scaler = MinMaxScaler()
-        y_scaled = self.scaler.fit_transform(y.reshape(-1, 1)).flatten()  # Flatten to 1D
+        y_scaled = self.scaler.fit_transform(y.reshape(-1, 1))
         X, ys = create_sequences(y_scaled, self.seq_length)
         if len(X) == 0:
             return self
-        X = torch.from_numpy(X).float().unsqueeze(2)  # (samples, seq, 1)
-        ys = torch.from_numpy(ys).float().unsqueeze(1)
+        X = torch.from_numpy(X).float()
+        ys = torch.from_numpy(np.array(ys)).float().unsqueeze(1)
         self.model = LSTMForecaster(input_size=1)
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
@@ -150,15 +151,15 @@ class DeepLearningForecaster:
                 forecasts += noise
             return np.maximum(forecasts, last_value * 0.9)
         # LSTM predict
-        y_scaled = self.scaler.transform(self.history.reshape(-1, 1)).flatten()  # Flatten to 1D
-        inputs = torch.from_numpy(y_scaled[-self.seq_length:]).float().unsqueeze(0).unsqueeze(1)  # (1, seq, 1)
+        y_scaled = self.scaler.transform(self.history.reshape(-1, 1))
+        inputs = torch.from_numpy(y_scaled[-self.seq_length:]).float().unsqueeze(0)
         forecasts = []
         self.model.eval()
         for _ in range(steps):
             pred = self.model(inputs)
             forecasts.append(pred.item())
-            new_input = pred.unsqueeze(1)  # (1,1)
-            inputs = torch.cat((inputs[:, 1:, :], new_input.unsqueeze(2)), dim=1)  # Append along seq dim
+            new_input = pred.unsqueeze(1).unsqueeze(2)
+            inputs = torch.cat((inputs[:, 1:, :], new_input), dim=1)
         return self.scaler.inverse_transform(np.array(forecasts).reshape(-1, 1)).flatten()
 
 class RAGPipeline:
@@ -342,28 +343,28 @@ class TRIFUSIONFramework:
 # ======= TOP-LEVEL CACHED FUNCTIONS FOR DOSM DATA LOADING ====
 @st.cache_data(ttl=3600)
 def load_cpi_data_cached(state: str, start_date: str) -> pd.DataFrame:
-    base_url = "https://storage.dosm.gov.my"
-    dataset_path = "/cpi/cpi_2d_state.parquet"
+    api_url = "https://api.data.gov.my/data-catalogue"
     try:
-        url = f"{base_url}{dataset_path}"
-        df = pd.read_parquet(url)
+        id_value = "cpi_headline" if state == "Malaysia" else "cpi_state"
+        params = {
+            "id": id_value,
+            "limit": 0,  # 0 for all
+            "division": "overall"
+        }
+        if state != "Malaysia":
+            params["state"] = state
+        response = requests.get(api_url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        df = pd.DataFrame(data)
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        state_col = next((col for col in ['state', 'state_name'] if col in df.columns), None)
-        if state_col:
-            if state == "Malaysia":
-                df_filtered = df[df[state_col].str.lower().isin(["malaysia", "sea_malaysia"])]
-            else:
-                df_filtered = df[df[state_col] == state]
-        else:
-            df_filtered = df
-        df_filtered = df_filtered[
-            (df_filtered['date'] >= pd.Timestamp(start_date)) &
-            (df_filtered['date'] <= pd.Timestamp.now())
-        ].sort_values('date').reset_index(drop=True)
-        if df_filtered.empty:
+        df = df[df['date'] >= pd.Timestamp(start_date)].sort_values('date').reset_index(drop=True)
+        if df.empty:
             raise ValueError("No data after filtering")
-        st.success(f"✅ Loaded {len(df_filtered)} CPI records for {state}")
-        return df_filtered
+        if state == "Malaysia":
+            df['state'] = "Malaysia"
+        st.success(f"✅ Loaded {len(df)} CPI records for {state}")
+        return df
     except Exception as e:
         st.error(f"❌ Failed to load DOSM data: {str(e)}")
         return generate_synthetic_cpi(state, start_date)
@@ -449,7 +450,7 @@ class TRIFUSIONApp:
                 epochs=epochs,
                 api_key=api_key or None,
                 use_rag=use_rag,
-                uncertainty_weighting=use_rag,
+                uncertainty_weighting=uncertainty_weighting,
                 state=state
             )
             st.markdown("---")
