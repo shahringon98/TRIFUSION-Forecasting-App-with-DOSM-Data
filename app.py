@@ -354,11 +354,16 @@ def load_cpi_data_cached(state: str, start_date: str) -> pd.DataFrame:
     if state != "Malaysia":
         params["state"] = api_state
     try:
-        response = requests.get(api_url, params=params)
+        response = requests.get(api_url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
+        if not data:
+            raise ValueError("Empty response from API")
         df = pd.DataFrame(data)
+        if 'date' not in df.columns:
+            raise KeyError("'date' column not found in API response")
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df = df.dropna(subset=['date'])  # Drop rows with invalid dates
         df = df[df['date'] >= pd.Timestamp(start_date)].sort_values('date').reset_index(drop=True)
         if df.empty:
             raise ValueError("No data after filtering")
@@ -366,9 +371,15 @@ def load_cpi_data_cached(state: str, start_date: str) -> pd.DataFrame:
             df['state'] = "Malaysia"
         st.success(f"✅ Loaded {len(df)} CPI records for {state}")
         return df
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ API request failed: {str(e)}")
+    except ValueError as e:
+        st.error(f"❌ Data processing error: {str(e)}")
+    except KeyError as e:
+        st.error(f"❌ Missing expected column: {str(e)}")
     except Exception as e:
-        st.error(f"❌ Failed to load DOSM data: {str(e)}")
-        return generate_synthetic_cpi(state, start_date)
+        st.error(f"❌ Unexpected error: {str(e)}")
+    return generate_synthetic_cpi(state, start_date)
 
 @st.cache_data
 def load_exogenous_data_cached(start_date: str) -> pd.DataFrame:
@@ -413,7 +424,7 @@ def generate_synthetic_cpi(state: str, start_date: str) -> pd.DataFrame:
         noise = np.random.normal(0, 0.25)
         cpi = base_cpi * trend * seasonal * breaks + noise
         values.append(max(95, min(135, cpi)))
-    return pd.DataFrame({'date': dates, 'state': state, 'index': values})
+    return pd.DataFrame({'date': dates, 'state': state, 'cpi': values})  # Use 'cpi' for consistency
 
 # =========== Streamlit App Class (uses top-level cached functions) ==========
 class TRIFUSIONApp:
@@ -473,11 +484,11 @@ class TRIFUSIONApp:
         full_data = full_data.sort_values('date').reset_index(drop=True)
         numeric_cols = ['oil_price', 'usd_myr', 'policy_shock', 'covid_impact']
         full_data[numeric_cols] = full_data[numeric_cols].ffill().fillna(0)
-        full_data = full_data.dropna(subset=['index', 'date'])
+        full_data = full_data.dropna(subset=['cpi', 'date'])  # Use 'cpi'
         if full_data.empty:
             st.error("❌ No valid data available after merging. Please check data sources.")
             return
-        y = full_data['index'].values
+        y = full_data['cpi'].values
         exog = full_data[numeric_cols].values
         train_size = len(y) - 24 if len(y) > 24 else int(0.8 * len(y))
         y_train, y_test = y[:train_size], y[train_size:]
