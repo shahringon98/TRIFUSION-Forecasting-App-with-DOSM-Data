@@ -342,7 +342,7 @@ class TRIFUSIONFramework:
 @st.cache_data(ttl=3600)
 def load_cpi_data_cached(state: str, start_date: str) -> pd.DataFrame:
     base_url = "https://storage.dosm.gov.my"
-    dataset_path = "/timeseries/cpi/cpi_2d_state.parquet"
+    dataset_path = "/cpi/cpi_2d_state.parquet"
     try:
         url = f"{base_url}{dataset_path}"
         df = pd.read_parquet(url)
@@ -410,7 +410,7 @@ def generate_synthetic_cpi(state: str, start_date: str) -> pd.DataFrame:
         noise = np.random.normal(0, 0.25)
         cpi = base_cpi * trend * seasonal * breaks + noise
         values.append(max(95, min(135, cpi)))
-    return pd.DataFrame({'date': dates, 'state': state, 'value': values})  # Use 'value' for consistency
+    return pd.DataFrame({'date': dates, 'state': state, 'index': values})  # Use 'index' for consistency
 
 # =========== Streamlit App Class (uses top-level cached functions) ==========
 class TRIFUSIONApp:
@@ -470,11 +470,11 @@ class TRIFUSIONApp:
         full_data = full_data.sort_values('date').reset_index(drop=True)
         numeric_cols = ['oil_price', 'usd_myr', 'policy_shock', 'covid_impact']
         full_data[numeric_cols] = full_data[numeric_cols].ffill().fillna(0)
-        full_data = full_data.dropna(subset=['value', 'date'])  # Use 'value'
+        full_data = full_data.dropna(subset=['index', 'date'])  # Use 'index'
         if full_data.empty:
             st.error("❌ No valid data available after merging. Please check data sources.")
             return
-        y = full_data['value'].values
+        y = full_data['index'].values
         exog = full_data[numeric_cols].values
         train_size = len(y) - 24 if len(y) > 24 else int(0.8 * len(y))
         y_train, y_test = y[:train_size], y[train_size:]
