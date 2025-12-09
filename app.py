@@ -99,7 +99,7 @@ def create_sequences(data, seq_length):
     xs, ys = [], []
     for i in range(len(data) - seq_length):
         x = data[i:(i + seq_length)]
-        y = data[i + seq_length, 0]
+        y = data[i + seq_length]
         xs.append(x)
         ys.append(y)
     return np.array(xs), np.array(ys)
@@ -122,8 +122,8 @@ class DeepLearningForecaster:
         X, ys = create_sequences(y_scaled, self.seq_length)
         if len(X) == 0:
             return self
-        X = torch.from_numpy(X).float()
-        ys = torch.from_numpy(np.array(ys)).float().unsqueeze(1)
+        X = torch.from_numpy(X).float().unsqueeze(2)  # (samples, seq, 1)
+        ys = torch.from_numpy(ys).float().unsqueeze(1)
         self.model = LSTMForecaster(input_size=1)
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
@@ -152,14 +152,13 @@ class DeepLearningForecaster:
             return np.maximum(forecasts, last_value * 0.9)
         # LSTM predict
         y_scaled = self.scaler.transform(self.history.reshape(-1, 1))
-        inputs = torch.from_numpy(y_scaled[-self.seq_length:]).float().unsqueeze(0)
+        inputs = torch.from_numpy(y_scaled[-self.seq_length:]).float().unsqueeze(0).unsqueeze(2)
         forecasts = []
         self.model.eval()
         for _ in range(steps):
             pred = self.model(inputs)
             forecasts.append(pred.item())
-            new_input = pred.unsqueeze(1).unsqueeze(2)
-            inputs = torch.cat((inputs[:, 1:, :], new_input), dim=1)
+            inputs = torch.cat((inputs[:, 1:, :], pred.unsqueeze(0).unsqueeze(2)), dim=1)
         return self.scaler.inverse_transform(np.array(forecasts).reshape(-1, 1)).flatten()
 
 class RAGPipeline:
@@ -344,15 +343,17 @@ class TRIFUSIONFramework:
 @st.cache_data(ttl=3600)
 def load_cpi_data_cached(state: str, start_date: str) -> pd.DataFrame:
     api_url = "https://api.data.gov.my/data-catalogue"
+    state_map = {"Penang": "pulau pinang"}
+    api_state = state_map.get(state, state).lower()
+    id_value = "cpi_headline" if state == "Malaysia" else "cpi_state"
+    params = {
+        "id": id_value,
+        "limit": 0,
+        "division": "overall"
+    }
+    if state != "Malaysia":
+        params["state"] = api_state
     try:
-        id_value = "cpi_headline" if state == "Malaysia" else "cpi_state"
-        params = {
-            "id": id_value,
-            "limit": 0,  # 0 for all
-            "division": "overall"
-        }
-        if state != "Malaysia":
-            params["state"] = state
         response = requests.get(api_url, params=params)
         response.raise_for_status()
         data = response.json()
@@ -412,7 +413,7 @@ def generate_synthetic_cpi(state: str, start_date: str) -> pd.DataFrame:
         noise = np.random.normal(0, 0.25)
         cpi = base_cpi * trend * seasonal * breaks + noise
         values.append(max(95, min(135, cpi)))
-    return pd.DataFrame({'date': dates, 'state': state, 'index': values})  # Use 'index' for consistency
+    return pd.DataFrame({'date': dates, 'state': state, 'index': values})
 
 # =========== Streamlit App Class (uses top-level cached functions) ==========
 class TRIFUSIONApp:
@@ -472,7 +473,7 @@ class TRIFUSIONApp:
         full_data = full_data.sort_values('date').reset_index(drop=True)
         numeric_cols = ['oil_price', 'usd_myr', 'policy_shock', 'covid_impact']
         full_data[numeric_cols] = full_data[numeric_cols].ffill().fillna(0)
-        full_data = full_data.dropna(subset=['index', 'date'])  # Use 'index'
+        full_data = full_data.dropna(subset=['index', 'date'])
         if full_data.empty:
             st.error("❌ No valid data available after merging. Please check data sources.")
             return
