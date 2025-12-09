@@ -1,113 +1,160 @@
-# app.py - Minimal, Stable Version
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
 import warnings
 warnings.filterwarnings('ignore')
 
-# --- FIX #1: Memory Management ---
-tf.config.experimental.set_memory_growth(tf.config.experimental.list_physical_devices('GPU')[0], True) if tf.config.experimental.list_physical_devices('GPU') else None
-
-# --- FIX #2: Simpler State Management ---
-if 'data' not in st.session_state: st.session_state.data = None
-if 'model' not in st.session_state: st.session_state.model = None
-
-st.title("📈 LSTM Forecaster - Minimal Version")
-
-# --- DATA LOADING (with fallback) ---
-st.sidebar.header("1. Load Data")
-@st.cache_data
-def load_data():
+# --- KILL SWITCH: If any step fails, show error and STOP ---
+def safe_run(func, error_msg):
     try:
-        url = "https://raw.githubusercontent.com/plotly/datasets/master/timeseries.csv"
-        df = pd.read_csv(url, index_col=0, parse_dates=True)
-        return df
-    except:
-        # Fallback: generate synthetic data
-        st.warning("⚠️ Could not load dataset, using synthetic data")
-        dates = pd.date_range('2020-01-01', periods=500)
-        data = np.cumsum(np.random.randn(500)) + 100
-        return pd.DataFrame(data, index=dates, columns=['value'])
+        return func()
+    except Exception as e:
+        st.error(f"🔴 {error_msg}")
+        st.code(str(e))  # Show the exact error
+        st.stop()  # Stop the app here
 
-if st.sidebar.button("Load Sample Data"):
-    st.session_state.data = load_data()
-    st.success("✅ Data loaded!")
+st.set_page_config(page_title="LSTM App", layout="wide")
+st.title("🔧 LSTM Time Series - DEFENSIVE MODE")
 
-# Only show the rest if data exists
-if st.session_state.data is not None:
+# --- SECTION 1: DATA LOADING ---
+st.header("1️⃣ Load Data")
+st.info("This step loads data. If it fails, your CSV or network is the problem.")
+
+@st.cache_data(ttl=3600)
+def load_sample_data():
+    # Try multiple sources in case one fails
+    sources = [
+        "https://raw.githubusercontent.com/plotly/datasets/master/timeseries.csv",
+        "https://raw.githubusercontent.com/AileenNielsen/TimeSeriesAnalysisWithPython/master/data/AirPassengers.csv"
+    ]
+    for url in sources:
+        try:
+            df = pd.read_csv(url, index_col=0, parse_dates=True)
+            if not df.empty:
+                return df
+        except:
+            continue
+    # Ultimate fallback: create fake data
+    st.warning("⚠️ All URLs failed. Using synthetic data.")
+    dates = pd.date_range('2020-01-01', periods=200)
+    return pd.DataFrame({'value': np.cumsum(np.random.randn(200)) + 100}, index=dates)
+
+if st.button("📥 LOAD DATA (Click me first)"):
+    st.session_state.data = safe_run(load_sample_data, "Data loading failed")
+    st.success("✅ Data loaded successfully!")
+
+# --- SECTION 2: PREPROCESSING ---
+if 'data' in st.session_state and st.session_state.data is not None:
+    st.header("2️⃣ Preprocess Data")
+    st.info("If this fails, your data format is wrong.")
+    
     df = st.session_state.data
-    target_col = st.sidebar.selectbox("Select column", df.columns.tolist())
+    target_col = st.selectbox("Select target column", df.columns.tolist())
     series = df[target_col].dropna()
     
-    # --- PREPROCESSING ---
-    st.sidebar.header("2. Preprocess")
-    lookback = st.sidebar.slider("Lookback", 5, 50, 10)
-    epochs = st.sidebar.slider("Epochs", 5, 50, 20)
+    # Parameters
+    lookback = st.slider("Lookback window", 5, 50, 10)
+    epochs = st.slider("Epochs", 5, 30, 10)  # Reduced for speed
     
-    if st.sidebar.button("Prepare Data"):
-        scaler = MinMaxScaler()
-        scaled = scaler.fit_transform(series.values.reshape(-1, 1)).flatten()
+    if st.button("🧹 PREPARE DATA"):
+        def prep_data():
+            # Scale
+            scaler = safe_run(lambda: __import__('sklearn.preprocessing', fromlist=['MinMaxScaler']).MinMaxScaler(), 
+                              "Failed to import sklearn")
+            scaled = safe_run(lambda: scaler.fit_transform(series.values.reshape(-1, 1)).flatten(),
+                              "Scaling failed")
+            
+            # Create sequences
+            def create_seq(data, lb):
+                X, y = [], []
+                for i in range(len(data) - lb):
+                    X.append(data[i:i+lb])
+                    y.append(data[i+lb])
+                return np.array(X), np.array(y)
+            
+            X, y = safe_run(lambda: create_seq(scaled, lookback), "Sequence creation failed")
+            
+            # Store everything
+            st.session_state.scaler = scaler
+            st.session_state.X = X.reshape(-1, lookback, 1)
+            st.session_state.y = y
+            st.session_state.lookback = lookback
+            st.session_state.epochs = epochs
+            return "Success"
         
-        X, y = [], []
-        for i in range(len(scaled) - lookback):
-            X.append(scaled[i:i+lookback])
-            y.append(scaled[i+lookback])
-        
-        X = np.array(X).reshape(-1, lookback, 1)
-        y = np.array(y)
-        
-        # Store in session
-        st.session_state.X = X
-        st.session_state.y = y
-        st.session_state.scaler = scaler
-        st.session_state.lookback = lookback
+        safe_run(prep_data, "Data preparation failed")
         st.success("✅ Data prepared!")
+
+# --- SECTION 3: TENSORFLOW (Most likely failure point) ---
+if 'X' in st.session_state:
+    st.header("3️⃣ Model Training")
+    st.warning("🐢 TensorFlow is SLOW. This may take 1-2 minutes.")
     
-    # --- TRAIN MODEL ---
-    if hasattr(st.session_state, 'X'):
-        if st.sidebar.button("Train LSTM"):
-            with st.spinner("Training..."):
+    # Memory management
+    try:
+        import tensorflow as tf
+        tf.config.experimental.set_memory_growth(
+            tf.config.experimental.list_physical_devices('GPU')[0], True
+        ) if tf.config.experimental.list_physical_devices('GPU') else None
+    except:
+        pass
+    
+    if st.button("🚀 TRAIN MODEL (Be patient)"):
+        with st.spinner("Training in progress... DO NOT REFRESH"):
+            def train_model():
+                # Lazy import to fail fast if TensorFlow is missing
+                tf = __import__('tensorflow')
+                from tensorflow.keras.models import Sequential
+                from tensorflow.keras.layers import LSTM, Dense, Dropout
+                
                 model = Sequential([
-                    LSTM(50, activation='relu', input_shape=(st.session_state.lookback, 1)),
+                    LSTM(32, activation='relu', input_shape=(lookback, 1)),
                     Dropout(0.2),
                     Dense(1)
                 ])
                 model.compile(optimizer='adam', loss='mse')
-                model.fit(st.session_state.X, st.session_state.y, epochs=epochs, verbose=0)
+                
+                # Train with progress
+                progress = st.progress(0)
+                for i in range(epochs):
+                    model.fit(st.session_state.X, st.session_state.y, 
+                             epochs=1, batch_size=16, verbose=0)
+                    progress.progress((i + 1) / epochs)
+                
                 st.session_state.model = model
-                st.success("✅ Model trained!")
-        
-        # --- PREDICT & VISUALIZE ---
-        if st.session_state.model is not None:
-            model = st.session_state.model
-            predictions = model.predict(st.session_state.X, verbose=0)
+                return "Training complete"
             
-            # Invert scaling
-            pred_actual = st.session_state.scaler.inverse_transform(predictions)
-            y_actual = st.session_state.scaler.inverse_transform(st.session_state.y.reshape(-1, 1))
-            
-            # Plot
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=series.index[st.session_state.lookback:], y=y_actual.flatten(), name="Actual", line=dict(color="blue")))
-            fig.add_trace(go.Scatter(x=series.index[st.session_state.lookback:], y=pred_actual.flatten(), name="Predicted", line=dict(color="red", dash='dot')))
-            fig.update_layout(title="Forecast", height=500)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Metrics
-            rmse = np.sqrt(mean_squared_error(y_actual, pred_actual))
-            mae = mean_absolute_error(y_actual, pred_actual)
-            st.metric("RMSE", f"{rmse:.2f}")
-            st.metric("MAE", f"{mae:.2f}")
+            safe_run(train_model, "TENSORFLOW FAILED. See error below.")
+            st.success("✅ Model trained!")
 
-# Debug info
-with st.expander("Debugging Info"):
-    st.text("Session State Keys:")
-    st.write(list(st.session_state.keys()))
-    st.text("TensorFlow Version:")
-    st.write(tf.__version__)
+# --- SECTION 4: RESULTS ---
+if 'model' in st.session_state:
+    st.header("4️⃣ Results")
+    
+    def get_results():
+        model = st.session_state.model
+        predictions = model.predict(st.session_state.X, verbose=0)
+        
+        # Inverse scale
+        pred_actual = st.session_state.scaler.inverse_transform(predictions).flatten()
+        y_actual = st.session_state.scaler.inverse_transform(st.session_state.y.reshape(-1, 1)).flatten()
+        
+        # Plot
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=series.index[lookback:], y=y_actual, name="Actual", line=dict(color="blue")))
+        fig.add_trace(go.Scatter(x=series.index[lookback:], y=pred_actual, name="Predicted", line=dict(color="red", dash='dot')))
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Metrics
+        from sklearn.metrics import mean_squared_error, mean_absolute_error
+        rmse = np.sqrt(mean_squared_error(y_actual, pred_actual))
+        mae = mean_absolute_error(y_actual, pred_actual)
+        st.metric("RMSE", f"{rmse:.2f}")
+        st.metric("MAE", f"{mae:.2f}")
+    
+    safe_run(get_results, "Result generation failed")
+
+# --- DEBUGGING INFO ---
+with st.expander("🐛 Click here if you still see 'Error running app'"):
+    st.info("Copy the error message below and paste it in your reply to me.")
+    st.code(st.session_state)
