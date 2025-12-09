@@ -5,3 +5,5 @@ statsmodels
 torch
 scikit-learn
 matplotlib
+plotly
+pmdarima
