@@ -1,187 +1,250 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from statsmodels.tsa.vector_ar.var_model import VAR
 import torch
 import torch.nn as nn
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import MinMaxScaler
-import matplotlib.pyplot as plt
+import pmdarima as pm
+import plotly.graph_objects as go
 
-# Multivariate LSTM Model (input multiple series, output GDP)
-class MultivariateLSTM(nn.Module):
-    def __init__(self, input_size=2, hidden_size=50, num_layers=1, output_size=1):
-        super(MultivariateLSTM, self).__init__()
+# =========== Robust DOSM Data Loader ===========
+@st.cache_data
+def load_dosm_data():
+    url = 'https://storage.dosm.gov.my/gdp/gdp_qtr_real.parquet'
+    try:
+        df = pd.read_parquet(url)
+    except Exception as e:
+        st.error(f"Error loading Parquet file: {e}")
+        st.stop()
+    
+    st.write("DEBUG: Loaded DataFrame columns:", df.columns.tolist())
+
+    required = {"date", "gdp", "series"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        st.error(f"Missing columns in data: {missing_cols}")
+        st.write("Available columns:", df.columns.tolist())
+        st.stop()
+
+    try:
+        df['date'] = pd.to_datetime(df['date'])
+    except Exception as e:
+        st.error(f"Error converting 'date' to datetime: {e}")
+        st.stop()
+        
+    # Filter for absolute series if available
+    if "series" in df.columns:
+        df = df[df['series'] == 'abs'].copy()
+
+    # Create 'quarter' column
+    try:
+        df['quarter'] = df['date'].dt.year.astype(str) + '-Q' + df['date'].dt.quarter.astype(str)
+    except Exception as e:
+        st.error(f"Error creating 'quarter' from 'date': {e}")
+        st.stop()
+
+    final_cols = {"quarter", "gdp"}
+    missing_final = final_cols - set(df.columns)
+    if missing_final:
+        st.error(f"Missing columns after processing: {missing_final}")
+        st.write("Available columns now:", df.columns.tolist())
+        st.stop()
+
+    df = df[['quarter', 'gdp']].set_index('quarter')
+    if df.empty:
+        st.error("No data found after filtering and selecting columns.")
+        st.stop()
+    if df.isnull().any().any():
+        st.warning("Data contains NaN values. Filling with forward fill.")
+        df = df.fillna(method='ffill')
+    return df['gdp'].values.astype(float), df.index
+
+# =========== LSTM Model ===========
+class LSTMForecaster(nn.Module):
+    def __init__(self, input_size=1, hidden_size=50, num_layers=1, output_size=1):
+        super(LSTMForecaster, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size)
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device)
         out, _ = self.lstm(x, (h0, c0))
         out = self.fc(out[:, -1, :])
         return out
 
-# Create sequences for multivariate data
-def create_multivariate_sequences(data, seq_length, target_col=0):
+# =========== Sequence Helper ===========
+def create_sequences(data, seq_length):
     xs, ys = [], []
     for i in range(len(data) - seq_length):
-        x = data[i:(i + seq_length)]
-        y = data[i + seq_length, target_col]  # Target is GDP
-        xs.append(x)
-        ys.append(y)
+        xs.append(data[i:i+seq_length])
+        ys.append(data[i+seq_length])
     return np.array(xs), np.array(ys)
 
-# VAR Forecast Function
+# =========== ARIMA  (auto_arima, robust) ===========
 @st.cache_data
-def var_forecast(train_df, forecast_steps):
+def arima_forecast(train_data, forecast_steps):
     try:
-        model = VAR(train_df)
-        fit = model.fit(maxlags=4)  # Adjust lags as needed
-        forecast = fit.forecast(train_df.values[-fit.k_ar:], steps=forecast_steps)
-        return forecast[:, 0]  # Return GDP forecasts
+        model = pm.auto_arima(train_data, seasonal=False, stepwise=True, suppress_warnings=True)
+        forecast = model.predict(n_periods=forecast_steps)
+        return forecast
     except Exception as e:
-        st.error(f"VAR failed: {e}")
+        st.error(f"ARIMA failed: {e}")
         return np.zeros(forecast_steps)
 
-# Multivariate LSTM Forecast Function
+# =========== LSTM Forecast (robust, GPU support) ===========
 @st.cache_data
-def lstm_forecast(train_data, forecast_steps, seq_length=4, epochs=50):
+def lstm_forecast(train_data, forecast_steps, seq_length, hidden_size, num_layers, epochs, lr):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     scaler = MinMaxScaler()
-    scaled_data = scaler.fit_transform(train_data)  # train_data is (samples, 2)
+    scaled_data = scaler.fit_transform(train_data.reshape(-1, 1))
 
-    X, y = create_multivariate_sequences(scaled_data, seq_length)
-    X = torch.from_numpy(X).float()
-    y = torch.from_numpy(y).float().unsqueeze(1)
+    X, y = create_sequences(scaled_data, seq_length)
+    X = torch.from_numpy(X).float().unsqueeze(2).to(device)
+    y = torch.from_numpy(y).float().to(device)
 
-    model = MultivariateLSTM(input_size=2)
+    model = LSTMForecaster(input_size=1, hidden_size=hidden_size, num_layers=num_layers, output_size=1).to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(epochs):
         model.train()
         outputs = model(X)
         optimizer.zero_grad()
-        loss = criterion(outputs, y)
+        loss = criterion(outputs.view(-1), y.view(-1))
         loss.backward()
         optimizer.step()
 
-    # Forecast (autoregressive: use last known M2, predict GDP sequentially)
+    # Prediction loop
     forecasts = []
-    inputs = torch.from_numpy(scaled_data[-seq_length:]).float().unsqueeze(0)
+    inputs = torch.from_numpy(scaled_data[-seq_length:]).float().unsqueeze(0).unsqueeze(2).to(device)
     model.eval()
     for _ in range(forecast_steps):
         pred = model(inputs)
         forecasts.append(pred.item())
-        # Shift: append predicted GDP, keep last M2 (assume M2 exog or repeat last)
-        new_input = torch.cat((inputs[0, -1, 1].unsqueeze(0), pred[0]), dim=0).unsqueeze(0)  # [M2_last, GDP_pred]
-        inputs = torch.cat((inputs[:, 1:, :], new_input.unsqueeze(0)), dim=1)
+        pred_reshaped = pred.unsqueeze(0).unsqueeze(2)
+        inputs = torch.cat((inputs[:, 1:, :], pred_reshaped), dim=1)
 
-    return scaler.inverse_transform(np.concatenate((np.zeros((forecast_steps, 1)), np.array(forecasts).reshape(-1, 1)), axis=1))[:, 1]  # Inverse GDP
+    return scaler.inverse_transform(np.array(forecasts).reshape(-1, 1)).flatten()
 
-# Dummy LLM Rationale
+# =========== Meta-Controller (safe) ===========
+def meta_controller(arima_pred, lstm_pred, train_data, val_data, seq_length,
+                    hidden_size, num_layers, epochs, lr):
+    arima_val_pred = arima_forecast(train_data, len(val_data))
+    lstm_val_pred = lstm_forecast(train_data, len(val_data), seq_length, hidden_size, num_layers, epochs, lr)
+
+    arima_rmse = mean_squared_error(val_data, arima_val_pred, squared=False)
+    lstm_rmse = mean_squared_error(val_data, lstm_val_pred, squared=False)
+    total_rmse = arima_rmse + lstm_rmse
+    w_arima = lstm_rmse / total_rmse if total_rmse > 0 else 0.5
+    w_lstm = arima_rmse / total_rmse if total_rmse > 0 else 0.5
+
+    ensemble_pred = w_arima * arima_pred + w_lstm * lstm_pred
+    return ensemble_pred, {
+        "ARIMA Weight": w_arima,
+        "LSTM Weight": w_lstm,
+        "ARIMA RMSE (val)": arima_rmse,
+        "LSTM RMSE (val)": lstm_rmse
+    }
+
 def dummy_llm_rationale(forecast):
-    return "Forecast influenced by GDP trends and M2 money supply growth, reflecting liquidity impacts on economic activity. Confidence: Medium."
+    return "Forecast based on recent trends in economic growth, influenced by factors like export demand and policy rates. Confidence: Medium."
 
-# Meta-Controller
-def meta_controller(var_pred, lstm_pred, val_data):
-    val_steps = min(4, len(val_data) // 2)  # Small val for demo
-    val_df = pd.DataFrame(val_data, columns=['gdp', 'm2'])
-    var_val_pred = var_forecast(val_df.iloc[:-val_steps], val_steps)
-    lstm_val_pred = lstm_forecast(val_data[:-val_steps], val_steps)
+# =========== Streamlit UI ===========
+st.title("TRIFUSION Forecasting App with DOSM GDP Data")
+st.write("Loads quarterly real GDP (constant 2015 prices, RM million) from DOSM for forecasting.")
 
-    var_rmse = mean_squared_error(val_data[-val_steps:, 0], var_val_pred, squared=False)
-    lstm_rmse = mean_squared_error(val_data[-val_steps:, 0], lstm_val_pred, squared=False)
+# ------ Data Loading ------
+try:
+    data, dates = load_dosm_data()
+except Exception as e:
+    st.error(f"Critical data error: {e}")
+    st.stop()
 
-    total_rmse = var_rmse + lstm_rmse
-    w_var = (lstm_rmse / total_rmse) if total_rmse > 0 else 0.5
-    w_lstm = (var_rmse / total_rmse) if total_rmse > 0 else 0.5
+if len(data) == 0:
+    st.error("No GDP data loaded. Cannot proceed.")
+    st.stop()
 
-    ensemble_pred = w_var * var_pred + w_lstm * lstm_pred
-    return ensemble_pred, {"VAR Weight": w_var, "LSTM Weight": w_lstm}
+st.subheader("Loaded DOSM Data Preview")
+st.dataframe(pd.DataFrame({"Quarter": dates, "Real GDP (RM Million)": data}))
 
-# Streamlit App
-st.title("Multivariate TRIFUSION Forecasting App with DOSM GDP & BNM M2 Data")
-st.write("Loads quarterly real GDP (DOSM) and resamples monthly M2 (BNM) to quarterly for multivariate forecasting.")
-
-@st.cache_data
-def load_data():
-    # Load GDP (quarterly)
-    gdp_url = 'https://storage.dosm.gov.my/gdp/gdp_qtr_real.parquet'
-    gdp_df = pd.read_parquet(gdp_url)
-    gdp_df['date'] = pd.to_datetime(gdp_df['date'])
-    gdp_df = gdp_df[gdp_df['series'] == 'abs'].copy()
-    gdp_df['quarter'] = gdp_df['date'].dt.to_period('Q').astype(str)
-    gdp_df = gdp_df.set_index('date')[['value', 'quarter']]  # Corrected to 'value'
-
-    # Load M2 (monthly, resample to quarterly end)
-    m2_url = 'https://storage.data.gov.my/finsector/money_aggregates.parquet'
-    m2_full_df = pd.read_parquet(m2_url)
-    print("Unique measures in M2 data:", m2_full_df['measure'].unique())  # Check console
-    m2_df = m2_full_df[m2_full_df['measure'].str.contains('broad_money_m2', case=False)]  # Updated filter
-    m2_df['date'] = pd.to_datetime(m2_df['date'])
-    m2_df = m2_df.set_index('date')['supply'].resample('Q').last()  # End of quarter
-    m2_df = pd.DataFrame({'m2': m2_df})
-    m2_df['quarter'] = m2_df.index.to_period('Q').astype(str)
-
-    # Merge on quarter
-    merged_df = gdp_df.merge(m2_df, on='quarter', how='inner')
-    data = merged_df[['value', 'm2']].values.astype(float)  # Corrected to 'value' for GDP
-    quarters = merged_df['quarter'].values
-
-    return data, quarters
-
-data, quarters = load_data()
-st.subheader("Loaded Multivariate Data Preview")
-st.dataframe(pd.DataFrame({"Quarter": quarters, "Real GDP (RM Million)": data[:, 0], "M2 (RM Million)": data[:, 1]}))
+# ------ User Controls ------
+st.sidebar.title("LSTM Hyperparameters")
+seq_length = st.sidebar.slider("Sequence Length", min_value=2, max_value=8, value=4)
+hidden_size = st.sidebar.slider("Hidden Size", min_value=4, max_value=128, value=50)
+num_layers = st.sidebar.slider("Num Layers", min_value=1, max_value=3, value=1)
+epochs = st.sidebar.slider("Epochs", min_value=10, max_value=200, value=50)
+learning_rate = st.sidebar.number_input("Learning Rate", min_value=1e-5, max_value=1e-1, value=0.001, format="%.5f")
 
 forecast_steps = st.slider("Forecast Quarters", min_value=1, max_value=8, value=4)
 
-# Split: 80% train, 20% test
-split = int(0.8 * len(data))
-train_data = data[:split]
-test_data = data[split:]
+# ------ Data Splitting ------
+n = len(data)
+train_split = int(0.7 * n)
+val_split = int(0.85 * n)
+train_data = data[:train_split]
+val_data = data[train_split:val_split]
+test_data = data[val_split:]
 
-# Forecasts (GDP)
-var_pred = var_forecast(pd.DataFrame(train_data, columns=['gdp', 'm2']), forecast_steps)
-lstm_pred = lstm_forecast(train_data, forecast_steps)
+if len(train_data) < seq_length + 1:
+    st.error(f"Not enough training data to make sequences of length {seq_length}. Lower seq_length or add data.")
+    st.stop()
 
-# Meta-controller using pseudo-validation on full data (focus on GDP)
-ensemble_pred, weights = meta_controller(var_pred, lstm_pred, data)
+if len(train_data) < forecast_steps:
+    st.error("Not enough training data for chosen forecast horizon.")
+    st.stop()
 
-# Dummy LLM
+# ------ Forecasts ------
+arima_pred = arima_forecast(train_data, forecast_steps)
+lstm_pred = lstm_forecast(train_data, forecast_steps, seq_length, hidden_size, num_layers, epochs, learning_rate)
+
+ensemble_pred, weights = meta_controller(
+    arima_pred, lstm_pred, train_data, val_data, seq_length, hidden_size, num_layers, epochs, learning_rate
+)
+
 rationale = dummy_llm_rationale(ensemble_pred)
 
-# Display Results
-st.subheader("GDP Forecast Results (Next Quarters)")
+st.subheader("Forecast Results (Next Quarters)")
 results = pd.DataFrame({
-    "VAR": var_pred,
+    "ARIMA": arima_pred,
     "LSTM": lstm_pred,
     "Ensemble": ensemble_pred
 }, index=[f"Future Q{i+1}" for i in range(forecast_steps)])
 st.dataframe(results)
 
-st.subheader("Weights from Meta-Controller")
+st.subheader("Weights and RMSE from Meta-Controller")
 st.json(weights)
 
 st.subheader("Dummy LLM Rationale")
 st.write(rationale)
 
-# Plot
-fig, ax = plt.subplots(figsize=(10, 6))
-ax.plot(quarters, data[:, 0], label="Historical GDP")
-future_quarters = [f"{quarters[-1][:4]}-Q{int(quarters[-1][-1]) + i + 1}" if int(quarters[-1][-1]) + i < 4 else f"{int(quarters[-1][:4]) + 1}-Q{(int(quarters[-1][-1]) + i) % 4 + 1}" for i in range(forecast_steps)]
-ax.plot(future_quarters, ensemble_pred, label="Ensemble GDP Forecast", color="green")
-ax.plot(quarters, data[:, 1] / 10, label="Historical M2 (scaled /10)", color="orange", alpha=0.5)  # Scaled for visibility
-ax.set_xlabel("Quarter")
-ax.set_ylabel("Value (RM Million)")
-ax.legend()
-ax.tick_params(axis='x', rotation=45)
-st.pyplot(fig)
+# ------ Interactive Plotly Chart ------
+future_quarters = []
+try:
+    q_year, q_num = int(dates[-1][:4]), int(dates[-1][-1])
+    for i in range(forecast_steps):
+        next_q = q_num + i + 1
+        if next_q <= 4:
+            future_quarters.append(f"{q_year}-Q{next_q}")
+        else:
+            years_add = (next_q - 1) // 4
+            xq = ((next_q - 1) % 4) + 1
+            future_quarters.append(f"{q_year + years_add}-Q{xq}")
+except Exception as e:
+    future_quarters = [f"Q{i+1}" for i in range(forecast_steps)]
 
-# Metrics on test data (GDP)
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=list(dates), y=data, mode='lines+markers', name='Historical GDP'))
+fig.add_trace(go.Scatter(x=future_quarters, y=ensemble_pred, mode='lines+markers', name='Ensemble Forecast', line=dict(color='green')))
+fig.update_layout(xaxis_title='Quarter', yaxis_title='Real GDP (RM Million)', width=950, height=450)
+st.plotly_chart(fig)
+
+# ------ Metrics on Test Data ------
 if len(test_data) >= forecast_steps:
-    test_rmse = mean_squared_error(test_data[:forecast_steps, 0], ensemble_pred, squared=False)
-    st.write(f"Ensemble RMSE on Test GDP: {test_rmse:.2f}")
+    test_rmse = mean_squared_error(test_data[:forecast_steps], ensemble_pred, squared=False)
+    st.write(f"Ensemble RMSE on Test Data: {test_rmse:.2f}")
+else:
+    st.write("Not enough test data for RMSE calculation.")
