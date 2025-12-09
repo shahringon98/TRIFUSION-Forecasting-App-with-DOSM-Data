@@ -1,9 +1,9 @@
 streamlit
 pandas
 numpy
-statsmodels
-torch
-scikit-learn
 matplotlib
+scikit-learn
+dataclasses
 plotly
-pmdarima
+openai
+rank_bm25
