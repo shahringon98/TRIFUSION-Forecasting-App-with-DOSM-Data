@@ -117,7 +117,7 @@ class DeepLearningForecaster:
             st.warning("Data too short for DL; using fallback")
             return self
         self.scaler = MinMaxScaler()
-        y_scaled = self.scaler.fit_transform(y.reshape(-1, 1))
+        y_scaled = self.scaler.fit_transform(y.reshape(-1, 1)).flatten()  # Flatten to 1D
         X, ys = create_sequences(y_scaled, self.seq_length)
         if len(X) == 0:
             return self
@@ -150,14 +150,15 @@ class DeepLearningForecaster:
                 forecasts += noise
             return np.maximum(forecasts, last_value * 0.9)
         # LSTM predict
-        y_scaled = self.scaler.transform(self.history.reshape(-1, 1))
-        inputs = torch.from_numpy(y_scaled[-self.seq_length:]).float().unsqueeze(0).unsqueeze(2)
+        y_scaled = self.scaler.transform(self.history.reshape(-1, 1)).flatten()  # Flatten to 1D
+        inputs = torch.from_numpy(y_scaled[-self.seq_length:]).float().unsqueeze(0).unsqueeze(1)  # (1, seq, 1)
         forecasts = []
         self.model.eval()
         for _ in range(steps):
             pred = self.model(inputs)
             forecasts.append(pred.item())
-            inputs = torch.cat((inputs[:, 1:, :], pred.unsqueeze(0).unsqueeze(2)), dim=1)
+            new_input = pred.unsqueeze(1)  # (1,1)
+            inputs = torch.cat((inputs[:, 1:, :], new_input.unsqueeze(2)), dim=1)  # Append along seq dim
         return self.scaler.inverse_transform(np.array(forecasts).reshape(-1, 1)).flatten()
 
 class RAGPipeline:
@@ -350,7 +351,7 @@ def load_cpi_data_cached(state: str, start_date: str) -> pd.DataFrame:
         state_col = next((col for col in ['state', 'state_name'] if col in df.columns), None)
         if state_col:
             if state == "Malaysia":
-                df_filtered = df[df[state_col].isin(["Malaysia", "SEA_MALAYSIA", "MALAYSIA"])]
+                df_filtered = df[df[state_col].str.lower().isin(["malaysia", "sea_malaysia"])]
             else:
                 df_filtered = df[df[state_col] == state]
         else:
@@ -448,7 +449,7 @@ class TRIFUSIONApp:
                 epochs=epochs,
                 api_key=api_key or None,
                 use_rag=use_rag,
-                uncertainty_weighting=uncertainty_weighting,
+                uncertainty_weighting=use_rag,
                 state=state
             )
             st.markdown("---")
